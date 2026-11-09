@@ -1,0 +1,24 @@
+services:
+  radio-gateway:
+    # 把 GHCR_OWNER 换成你的 GitHub 用户名（小写），例如 ghcr.io/sinos/radio-gateway:latest
+    image: ghcr.io/GHCR_OWNER/radio-gateway:latest
+    container_name: radio-gateway
+    restart: unless-stopped          # NAS 重启后自动拉起，不依赖任何 PC
+    ports:
+      - "8787:8787"                  # 播放器（piCorePlayer）通过 192.168.1.1:8787 访问
+    environment:
+      TZ: Asia/Shanghai
+      PORT: "8787"
+      UPSTREAM_TIMEOUT: "20"
+      UPSTREAM_RETRIES: "2"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "4", "-O", "/dev/null", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
