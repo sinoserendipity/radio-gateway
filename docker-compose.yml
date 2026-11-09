@@ -1,7 +1,7 @@
 services:
   radio-gateway:
-    # 把 GHCR_OWNER 换成你的 GitHub 用户名（小写），例如 ghcr.io/sinos/radio-gateway:latest
-    image: ghcr.io/GHCR_OWNER/radio-gateway:latest
+    # 把 sinoserendipity 换成你的 GitHub 用户名（小写），例如 ghcr.io/sinos/radio-gateway:latest
+    image: ghcr.io/sinoserendipity/radio-gateway:latest
     container_name: radio-gateway
     restart: unless-stopped          # NAS 重启后自动拉起，不依赖任何 PC
     ports:
