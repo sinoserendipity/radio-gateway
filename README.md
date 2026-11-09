@@ -48,7 +48,7 @@ ghcr.io/<你的GitHub用户名小写>/radio-gateway:v1.0.0
 
 ## 部署到 NAS
 
-1. 把 `docker-compose.yml` 里的 `GHCR_OWNER` 换成你的 GitHub 用户名（小写）。
+1. `docker-compose.yml` 里的镜像地址已填好：`ghcr.io/sinoserendipity/radio-gateway:latest`，直接可用。
 2. 把 `docker-compose.yml` 传到 NAS，例如 `/volume1/docker/radio-gateway/`。
 3. 在 NAS 上执行：
 
