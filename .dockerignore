@@ -1,0 +1,7 @@
+.git
+.github
+docker-compose.yml
+README.md
+*.pyc
+__pycache__
+.DS_Store
