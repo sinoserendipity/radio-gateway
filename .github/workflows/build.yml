@@ -49,6 +49,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=3.0.0
             type=ref,event=tag
             type=sha,format=short
 

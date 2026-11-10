@@ -2,114 +2,75 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 7bbacff6a13d1c14f228fc219ab631a5_2a5ccdeadbf211f19232525400248c00
-    ReservedCode1: CuygLkURJt1WbBoUCc3CRRtrXByMMwnjevYtEv8TcklEqys+uA3a4Ed+OTbr8/rUpve4cnZyccDJerodJwv4yONW4kDXGh0m4TumN/Fj858TFoyZkhN8UTo4FQmFreyCztT+PQQ1YEVhK6oQ+loudTaZlRS8S82uIqYBIy9Mv5doa7aWOWk4/wsVifU=
+    ProduceID: 7bbacff6a13d1c14f228fc219ab631a5_2b48dd87dccd11f19280525400393706
+    ReservedCode1: Zclck/4Zzv7uzRr0hu4q9CZxgVtqVBSUTdjEbcFm+5DoGWpU4V5Wv2WEWNhb7MP31JXYjiQh74kWZ1VDqqzUeUtBWJZrf7d3IN6TVVuaWOMgOLTi45ww3wc77NsaPQ1TRXwRmm6irQ7xsvh+1Oae/QPYXj92dFfmCFkhW/5Ia0+IBa/SYoaBbrTttEI=
     ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 7bbacff6a13d1c14f228fc219ab631a5_2a5ccdeadbf211f19232525400248c00
-    ReservedCode2: CuygLkURJt1WbBoUCc3CRRtrXByMMwnjevYtEv8TcklEqys+uA3a4Ed+OTbr8/rUpve4cnZyccDJerodJwv4yONW4kDXGh0m4TumN/Fj858TFoyZkhN8UTo4FQmFreyCztT+PQQ1YEVhK6oQ+loudTaZlRS8S82uIqYBIy9Mv5doa7aWOWk4/wsVifU=
+    PropagateID: 7bbacff6a13d1c14f228fc219ab631a5_2b48dd87dccd11f19280525400393706
+    ReservedCode2: Zclck/4Zzv7uzRr0hu4q9CZxgVtqVBSUTdjEbcFm+5DoGWpU4V5Wv2WEWNhb7MP31JXYjiQh74kWZ1VDqqzUeUtBWJZrf7d3IN6TVVuaWOMgOLTi45ww3wc77NsaPQ1TRXwRmm6irQ7xsvh+1Oae/QPYXj92dFfmCFkhW/5Ia0+IBa/SYoaBbrTttEI=
 ---
 
-# radio-gateway
+# radio-gateway v3.0.0（Docker 部署）
 
-把 `https://radio.0472.org/?id=xxx` 这类"302 到 HLS 但 URL 不带 `.m3u8` 后缀"
-的链接，转换成 Lyrion Music Server（LMS）PlayHLS 能识别的标准 HLS 地址。
+把 Cloudflare Worker 版 `worker_radio_gateway.js` v3.0.0 **原封不动**跑在 Node 容器里。
+业务逻辑零改动，只加了一层 HTTP 适配。
 
-## 为什么需要它
+## 为什么能直接跑
 
-| 环节 | 现象 | 后果 |
-| --- | --- | --- |
-| 上游 | `?id=xxx` 302 到真实 m3u8，落地 URL 无 `.m3u8` 后缀，Content-Type 为 `application/octet-stream` | PlayHLS 靠后缀识别 HLS，判不出来 |
-| 通用 CORS 代理 | 只转发首个 m3u8 文本，不重写分片相对路径 | 分片请求落到代理域名根，返回 HTML，播放失败 |
-| 本网关 | 跟随 302 + 补 `application/vnd.apple.mpegurl` + 重写分片路径并代拉 | 正常出声 |
+| Worker 运行时能力 | v3.0.0 用法 | Node 情况 |
+|---|---|---|
+| `fetch` / `Request` / `Response` / `Headers` / `URL` | 全部路由与上游请求 | Node 18+ 原生 |
+| `AbortSignal.timeout` | 上游超时控制 | Node 17.3+ 原生 |
+| `TextEncoder` | MD5 实现 | 原生 |
+| `crypto.subtle` | 未使用（自带纯 JS MD5） | 不涉及 |
+| `caches.default` | 二级缓存 | **源码已判空**，缺失时退回纯内存 |
+| `ctx.waitUntil` | 异步写缓存 | **源码已判函数**，无则同步跳过 |
+| `env.KV / D1 / R2` | **完全不依赖** | 无绑定需求 |
+| `env.FORCE_HTTPS` | 可选开关 | 由环境变量注入 |
 
-## 路由
+## 文件
 
-| 路径 | 作用 |
-| --- | --- |
-| `GET /r/<id>.m3u8` | 返回重写后的播放列表 |
-| `GET /r/<id>/seg/<b64url>` | 代拉真实分片（TS / fMP4 / AAC） |
-| `GET /health` | 健康检查，返回 `radio-gateway OK` |
+- `worker_radio_gateway.js` — v3.0.0 源码，未修改
+- `server.mjs` — Node HTTP ↔ Web Request/Response 适配层
+- `Dockerfile` — node:22-alpine，无 npm install，非 root 运行，带 HEALTHCHECK
+- `docker-compose.yml` — 端口 8787，自动重启
+- `.github/workflows/docker.yml` — buildx 多架构构建并推 GHCR
 
-## 构建（GitHub Actions 自动出镜像）
+## 构建 / 运行
 
-推送到 `main` 分支或打 `v*` 标签，`.github/workflows/build.yml` 会用 buildx
-构建 `linux/amd64` + `linux/arm64` 双架构镜像并推送到 GitHub Container Registry：
-
-```
-ghcr.io/<你的GitHub用户名小写>/radio-gateway:latest
-ghcr.io/<你的GitHub用户名小写>/radio-gateway:sha-xxxxxxx
-ghcr.io/<你的GitHub用户名小写>/radio-gateway:v1.0.0
-```
-
-首次推送后，到 GitHub 仓库 → Packages → `radio-gateway` → Package settings，
-把可见性设为 **Public**，否则 NAS 拉取需要 `docker login ghcr.io`。
-
-无凭据的 NAS 想直接拉公开镜像，下面的步骤即可。
-
-## 部署到 NAS
-
-1. `docker-compose.yml` 里的镜像地址已填好：`ghcr.io/sinoserendipity/radio-gateway:latest`，直接可用。
-2. 把 `docker-compose.yml` 传到 NAS，例如 `/volume1/docker/radio-gateway/`。
-3. 在 NAS 上执行：
+本地：
 
 ```bash
-cd /volume1/docker/radio-gateway
-docker compose up -d
-docker compose logs -f
+docker compose up -d --build
+curl http://127.0.0.1:8787/health          # ok 3.0.0
+curl http://127.0.0.1:8787/list/cnr.m3u
+curl http://127.0.0.1:8787/r/639.m3u8
 ```
 
-4. 验证：
+多架构构建推送：
 
 ```bash
-curl -I http://127.0.0.1:8787/health
-curl -I http://192.168.1.1:8787/r/1308.m3u8
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/sinoserendipity/radio-gateway:3.0.0 \
+  -t ghcr.io/sinoserendipity/radio-gateway:latest --push .
 ```
 
-第二条应返回 `HTTP/1.1 200 OK` 和 `Content-Type: application/vnd.apple.mpegurl`。
+## 接口
 
-5. `restart: unless-stopped` 保证 NAS 重启后自动上线，Windows 开机与否无关。
+| 路由 | 说明 |
+|---|---|
+| `GET /health` | 健康检查，返回 `ok 3.0.0` |
+| `GET /r/<contentId>.m3u8` | 单台 HLS 清单（LMS 收藏夹用） |
+| `GET /list/cnr.m3u` | 央广列表（`zj` / `sh` / `all` 同理） |
+| `GET /` | 用法说明 |
 
-## 收藏夹地址要跟着改
+参数：`?https=1` 把分片升为 https（仅浏览器端需要）。
 
-镜像跑在 NAS 上后，收藏夹里的地址前缀从 `192.168.1.102:8787` 换成
-`192.168.1.1:8787`。两种改法：
+## 与 Worker 版的差异
 
-- 在 LMS Web UI 里逐条编辑（59 条不现实）；
-- 或者直接替换 `favorites.opml` 里的 IP 后放回
-  `/usr/local/slimserver/prefs/`，重启 LMS 容器。
+1. **无边缘节点**：清单延迟取决于容器所在网络到 `ytmsout.radio.cn` 的链路，不再有 CF 边缘就近。
+2. **缓存只在进程内**：Cache API 缺失，容器重启后首次请求需回源一次（约 1~2s），之后内存命中。
+3. **单点**：容器挂了就没了。同一局域网内有多个消费端时，本地部署反而比公网 CF 少一跳。
 
-```bash
-sed -i 's/192\.168\.1\.102:8787/192.168.1.1:8787/g' favorites.opml
-```
-
-### 备选：NAS 拉不到 ghcr.io 时本地构建
-
-国内访问 ghcr.io 常被限速或阻断。此时把本目录（含 `Dockerfile`、`gateway.py`）
-整个传到 NAS，直接在 NAS 上构建，效果与 Actions 产出的镜像一致：
-
-```bash
-cd /volume1/docker/radio-gateway
-docker build -t radio-gateway:latest .
-docker rm -f radio-gateway 2>/dev/null
-docker run -d --name radio-gateway --restart unless-stopped \
-  -p 8787:8787 -e TZ=Asia/Shanghai radio-gateway:latest
-```
-
-## 本地无 Docker 时验证
-
-```bash
-python gateway.py
-curl -i http://127.0.0.1:8787/r/1308.m3u8
-```
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `PORT` | `8787` | 监听端口 |
-| `BIND` | `0.0.0.0` | 监听地址 |
-| `PROXY_HOST` | `radio.0472.org` | 上游代理域名 |
-| `UA` | `VLC/3.0.20 LibVLC/3.0.20` | 请求上游的 User-Agent |
-| `UPSTREAM_TIMEOUT` | `20` | 上游超时（秒） |
-| `UPSTREAM_RETRIES` | `2` | 分片拉取重试次数 |
+LMS 收藏夹里的 `${origin}/r/<id>.m3u8` 由 `/list/*.m3u` 动态生成，**改成容器地址后需重新导出 OPML**；
+若仍用 `https://hls.571998.xyz` 则无需任何改动。
 *（内容由AI生成，仅供参考）*

@@ -1,24 +1,24 @@
 services:
   radio-gateway:
-    # 镜像由 GitHub Actions 构建，公开可匿名拉取；fork 到别的账号时把 owner 改成你的用户名（小写）
-    image: ghcr.io/sinoserendipity/radio-gateway:latest
+    image: ghcr.io/sinoserendipity/radio-gateway:3.0.0
+    build:
+      context: .
     container_name: radio-gateway
-    restart: unless-stopped          # NAS 重启后自动拉起，不依赖任何 PC
+    restart: unless-stopped
     ports:
-      - "8787:8787"                  # 播放器（piCorePlayer）通过 192.168.1.1:8787 访问
+      - "8787:8787"
     environment:
       TZ: Asia/Shanghai
-      PORT: "8787"
-      UPSTREAM_TIMEOUT: "20"
-      UPSTREAM_RETRIES: "2"
+      # 1 = 清单里分片强制 https（浏览器端播放需要；LMS/PlayHLS 服务端拉流保持 0 走 http 更快）
+      FORCE_HTTPS: "0"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "4", "-O", "/dev/null", "http://127.0.0.1:8787/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
       interval: 30s
-      timeout: 5s
+      timeout: 4s
       retries: 3
       start_period: 5s
     logging:
       driver: json-file
       options:
         max-size: "5m"
-        max-file: "3"
+        max-file: "2"

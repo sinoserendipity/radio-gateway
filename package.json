@@ -1,0 +1,14 @@
+{
+  "name": "radio-gateway",
+  "version": "3.0.0",
+  "private": true,
+  "description": "radio.cn HLS gateway — Cloudflare Worker v3.0.0 running on Node",
+  "type": "module",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
