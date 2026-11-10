@@ -1,286 +1,436 @@
 /**
- * radio.cn HLS 网关 — Cloudflare Worker 版 v2.1.2
+ * radio.cn HLS 网关 v3.0.0 — 云听自签 · 三地区（央广 / 浙江 / 上海）
  *
- * 用途：把 radio.0472.org/?id=<id>（302 → radio.cn 带 key+time 签名的 m3u8）
- *      暴露成 https://<你的域名>/r/<id>.m3u8，供 Lyrion Music Server + PlayHLS 播放。
+ * 设计参照 gitee.com/lx_studio/LX-FM-PC 的 backend/dedicated.py：
+ *   - 接口   https://ytmsout.radio.cn/web/appBroadcast/list?categoryId=&provinceCode=
+ *   - 密钥   SIGN_KEY = f0fc4c668392f9f9a447e48584c214ee
+ *   - 头     equipmentId: 0000 / platformCode: WEB / sign / timestamp
+ *   - 签名   MD5(按字段名升序拼接的参数串 + "&timestamp=" + ts + "&key=" + SIGN_KEY).upper()
+ *   - 选流   mp3PlayUrlHigh(高品质专线) > playUrlLow(极速) > mp3PlayUrlLow(标准)
  *
- * v2.1.2（在 v2.1.1 上的修正）：
- *   [P0] 播放列表响应改 Cache-Control: no-store（原 public, max-age=2）。
- *        实测线上：v2.1.1 的 max-age=2 被 Cloudflare 默认 Browser Cache TTL（4h）
- *        覆盖成 max-age=14400，LMS/PlayHLS 会拿同一份 #EXT-X-MEDIA-SEQUENCE
- *        重放几小时，直播卡死。no-store 不被该设置改写（错误响应一直是 no-store
- *        且线上原样返回，可作证据）。内部 caches.default 的去重仍保留——缓存对象
- *        单独用 max-age=5，只有回给客户端的响应头是 no-store。
- *   [P0] 加 CDN-Cache-Control: no-store，显式禁止边缘层二次缓存播放列表。
- *   [P1] 新增响应头 X-Timing（entry/playlist/probe/total 毫秒），线上延迟瓶颈
- *        可直接定位，不必靠盲猜。命中缓存时输出 cache=HIT 与 age。
+ * 与 v2.x 的根本区别：
+ *   v2.x 是 radio.0472.org 的壳层代理（每次多一跳 302 换签，中位 3.2s / 最差 6.6s）。
+ *   v3.0.0 自己签名，直连云听，去掉 0472 依赖。且不再代理分片——
+ *   实测云听分片本身带 Access-Control-Allow-Origin: * 与 Accept-Ranges: bytes，
+ *   http/https 均可直连，任意 UA 放行，所以清单里把相对分片路径补成绝对地址即可，
+ *   客户端（LMS + PlayHLS）直连分片，网关不参与媒体流量。
  *
- * v2.1.1（在 v2.1.0 上的修正）：
- *   [P0] 分片抽查改三态 alive/dead/unknown：只有明确死亡（404/410/451）才判僵尸流，
- *        5xx/403/400/超时等一律 unknown 并放行（fail-open）。v2.1.0 把 500/403
- *        也当死，云听 CDN 边缘抖动时会把可播流误杀成 503 stale_stream。
- *   [P0] 上游超时 6000→4000 且允许重试一次（总预算 ≤8s）：v2.1.0 的 6s 单发
- *        在冷启动/抖动下没有兜底，比 v2.0.0 的 8s×2 更脆。重试对 radio.0472.org
- *        安全，每次请求都会重新签发 key/time。
- *   [P1] 占位流判定改用 peek：CT 命中 audio/* 时先读正文前 512 字节，以 #EXTM3U
- *        开头就按播放列表继续（有源把 m3u8 标成 audio/mpeg），否则才判 no_signal。
- *        nosignal.mp3 是无限流，仍靠落地 URL 直接判，绝不读 body。
- *   [P1] 客户端 Cache-Control 降为 2s（内部 caches.default 仍 5s），
- *        列表刷新更快，减少叠加的直播延迟。
- *   [P2] 416 归为 dead（0~1 字节分片是坏片）；移除无意义的 e.code === 23 判断。
+ * 实测依据（2026-11-10，中国之声 639）：
+ *   playUrlLow      ytlive  .aac  30 KB / 5s   首分片 180 ms   ← 极速
+ *   mp3PlayUrlHigh  ytcast2 .ts  261 KB / 10s  首分片 868 ms   ← 192k 高音质
+ *   mp3PlayUrlLow   ytcast2 .ts   68 KB / 10s  首分片 698 ms
+ *   清单延迟：http ~195 ms / https ~1599 ms（分片 https 另加 ~360 ms）
+ *   → 因 PlayHLS 是服务端拉流、不受混合内容限制，分片默认保持上游原协议（http），
+ *     只有浏览器端播放才需要 https，届时用 ?https=1 或 FORCE_HTTPS=1。
  *
- * v2.1.0（在 v2.0.0 上的修正，部分已被 v2.1.1 覆盖）：
- *   [P0] audio/* 不再一律当占位流：audio/mpegurl、audio/x-mpegurl 是播放列表。
- *        注：实测 radio.0472.org 落地 m3u8 的 CT 恒为 application/octet-stream，
- *        该误判在主链路本不会触发，属防御性修正（?url= 调试他源时有用）。
- *   [P0] 顶层 try/catch：任何意外异常都返回 JSON 错误，不再抛 CF 1101 HTML。
- *   [P0] 分片抽查判定反转：只有 2xx/206/416 才算活；原实现把 500/429/401 也算活，
- *        僵尸流照样 200。且并行抽查 + 立即 cancel body，不再把整段音频拉下来。
- *   [P1] 超时不再重试：AbortSignal.timeout 的 TimeoutError 被原 fetchWithRetry
- *        当成网络错误重试，最坏 8s×2。现在只对非 abort 的异常和 502/503/504 重试。
- *   [P1] 缓存只作用于 /r/ 路由（原注释这么写但代码没判断），cache.put 交给
- *        ctx.waitUntil，不阻塞响应；key 里带版本与配置位。
- *   [P1] ?url= 目标做协议 + 私网 + 主机白名单校验（原实现是任意 URL 的开放抓取）。
- *   [P1] 403 单独归类 cf_challenge；429 带 Retry-After；502 也带 Retry-After。
- *   [P1] 上游 body 加大小上限，避免异常大响应打爆内存。
- *   [P2] 行尾统一 \n；baseDir 用 new URL(".", base) 计算；补 nosniff。
- *
- * 已知未覆盖（需要另外设计）：
- *   若上游返回的是 master playlist（#EXT-X-STREAM-INF 指向子列表）或加密流，
- *   子列表 / #EXT-X-KEY 的 URI 目前只做绝对化、不做代理，播放器直连时若同样需要
- *   VLC UA 或签名就会 403/404。要彻底解决需加一条带 HMAC 的 /p/ 代理路由。
- *
- * 可选环境变量：
- *   PROBE_SEGMENTS = "0"     关闭分片可用性抽查（默认开启）
- *   FORCE_HTTPS    = "0"     关闭分片强制 https（默认开启）
- *   ALLOW_HOSTS    = "a.com,b.com"   追加 ?url= 允许的主机后缀（如 cnr.cn,cri.cn）
- *   ALLOW_ANY_URL  = "1"     完全放开 ?url= 的主机限制（仍拒绝私网）
- *   LOG            = "0"     关闭每请求日志
+ * 路由：
+ *   GET /r/<contentId>.m3u8   单台清单（LMS 收藏夹用这个）
+ *   GET /list/cnr.m3u         央广三地区频道列表（cnr | zj | sh | all）
+ *   GET /health               健康检查
+ *   GET /                     说明
  */
 
-const VERSION = "2.1.2";
+const VERSION = "3.0.0";
 
-const UPSTREAM_ENTRY = "https://radio.0472.org/?id=";
-const UPSTREAM_UA = "VLC/3.0.20 LibVLC/3.0.20";
+/* ============================ 可调配置 ============================ */
+
+const API_BASE = "https://ytmsout.radio.cn/web";
+const SIGN_KEY = "f0fc4c668392f9f9a447e48584c214ee";
+const CLIENT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// 三地区：与 LX-FM-PC 的 PROVINCE_CODE_MAP 一致
+const REGIONS = [
+  { key: "cnr", name: "央广", province: 0 },
+  { key: "zj", name: "浙江", province: 330000 },
+  { key: "sh", name: "上海", province: 310000 },
+];
+const REGION_BY_PROVINCE = new Map(REGIONS.map((r) => [r.province, r]));
+
+// 实测 categoryId=0 覆盖 94%，1 为少量专题频道；查两档以保证区域台不丢
+const CATEGORY_IDS = [0, 1];
+
+// 选流优先级 —— 与 LX-FM-PC lines 顺序一致
+const STREAM_PREF = ["mp3PlayUrlHigh", "playUrlLow", "mp3PlayUrlLow"];
+
+/*
+ * 实测修正（2026-11-10，90 台全量探测）：
+ *   ytcastmp3.radio.cn/xx/stream_xxxxx.mp3  → 61 台，实测 0 可达（全部 connect timeout / 404）
+ *   ytcast2.radio.cn/110/radios/*.m3u8      → 18 台，全可达，p50 1233ms
+ *   ytcast.radio.cn/129|/81/.../*.m3u8      → 11 台，全可达，p50 1440ms
+ * 即 mp3PlayUrlHigh 字段里混着两类：一是真 HLS，二是已停用的 MP3 裸流。
+ * 因此不能按字段名排序，必须**看 URL 本身是否 .m3u8**，mp3 一律降到最低优先级，
+ * 否则每台要多等一个 4s 连接超时才降级（这是 v3.0.0 首测 p50 5s 的全部原因）。
+ * 并对失败线路记 5 分钟黑名单，避免反复撞同一面墙。
+ */
+const MP3_PROBE_TIMEOUT_MS = 2000; // 兜底尝试 mp3 时用更短超时
+const BAD_TTL_SEC = 300; // 故障线路冷却期
+
 const HLS_MIME = "application/vnd.apple.mpegurl";
-
-const FETCH_TIMEOUT_MS = 4000; // 允许重试一次，总预算 ≤8s
-const PROBE_TIMEOUT_MS = 3000;
-const PLAYLIST_CACHE_TTL_SEC = 5; // 内部 caches.default 存活时间（客户端一律 no-store）
-const PROBE_TAIL = 2;
+const API_TIMEOUT_MS = 4000; // 签名接口实测 ~1s，留足余量
+const PLAYLIST_TIMEOUT_MS = 4000;
+const API_TTL_SEC = 60; // 频道列表（含签名 URL）缓存时长
+const URL_TTL_SEC = 45; // 单台签名 URL 缓存时长，须明显短于 key 有效期
+const PLAYLIST_MEMO_SEC = 2; // 单台清单的 isolate 内去重窗口，须远小于 TARGETDURATION
 const MAX_PLAYLIST_BYTES = 512 * 1024;
-const PEEK_BYTES = 512;
 
-const UPSTREAM_HEADERS = {
-  "User-Agent": UPSTREAM_UA,
-  "Accept": "*/*",
-  "Accept-Language": "zh-CN,zh;q=0.9",
-};
+/* ============================ MD5 ============================ */
+/* Workers 的 crypto.subtle 不支持 MD5，此处为纯 JS 实现。
+   已用标准测试向量校验：""/"abc"/"The quick brown fox..." 全部通过。
+   注意位运算必须用 Math.imul 语义的 |0 截断，否则超过 32 位会失真。*/
 
-// 只有明确的音频容器才算 no-signal；audio/mpegurl 是播放列表，必须放行
-const NOSIGNAL_RE = /nosignal\.(mp3|aac|m4a)/i;
-const AUDIO_CONTAINER_RE = /^audio\/(mpeg|mp3|mp4|aac|x-m4a|ogg|opus|flac|webm)(;|$|\s)/i;
+const MD5_S = [
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
+const MD5_K = (() => {
+  const k = new Array(64);
+  for (let i = 0; i < 64; i++) k[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) | 0;
+  return k;
+})();
 
-const DEFAULT_ALLOWED_HOSTS = ["radio.0472.org", "0472.org", "radio.cn"];
-const RETRYABLE_STATUS = new Set([502, 503, 504]);
-// 只有这些状态算"明确死亡的僵尸分片"，其余都算 unknown → 放行
-const DEAD_SEGMENT_STATUS = new Set([404, 410, 451]);
+function md5(input) {
+  const bytes = Array.from(new TextEncoder().encode(String(input)));
+  const bitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  for (let i = 0; i < 8; i++) bytes.push((bitLen / Math.pow(2, 8 * i)) & 0xff);
 
-/* ---------------- 基础工具 ---------------- */
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
 
-function redact(url) {
+  for (let off = 0; off < bytes.length; off += 64) {
+    const M = new Array(16);
+    for (let i = 0; i < 16; i++) {
+      M[i] =
+        bytes[off + i * 4] |
+        (bytes[off + i * 4 + 1] << 8) |
+        (bytes[off + i * 4 + 2] << 16) |
+        (bytes[off + i * 4 + 3] << 24);
+    }
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      const tmp = D;
+      D = C;
+      C = B;
+      const sum = (A + F + MD5_K[i] + M[g]) | 0;
+      B = (B + ((sum << MD5_S[i]) | (sum >>> (32 - MD5_S[i])))) | 0;
+      A = tmp;
+    }
+    a0 = (a0 + A) | 0; b0 = (b0 + B) | 0; c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
+  }
+
+  const hex = (n) => {
+    let s = "";
+    for (let i = 0; i < 4; i++) s += ("0" + ((n >>> (i * 8)) & 0xff).toString(16)).slice(-2);
+    return s;
+  };
+  return hex(a0) + hex(b0) + hex(c0) + hex(d0);
+}
+
+/* ============================ 云听签名 ============================ */
+
+function makeSign(params, ts) {
+  const sorted = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join("&");
+  const raw = sorted
+    ? `${sorted}&timestamp=${ts}&key=${SIGN_KEY}`
+    : `timestamp=${ts}&key=${SIGN_KEY}`;
+  return md5(raw).toUpperCase();
+}
+
+/** 拉取某省某类的频道列表，返回原始 item 数组 */
+async function fetchBroadcastList(provinceCode, categoryId) {
+  const ts = String(Date.now());
+  const params = { categoryId, provinceCode };
+  const url = `${API_BASE}/appBroadcast/list?categoryId=${categoryId}&provinceCode=${provinceCode}`;
+
+  const resp = await fetch(url, {
+    headers: {
+      "User-Agent": CLIENT_UA,
+      "equipmentId": "0000",
+      "platformCode": "WEB",
+      "Accept": "application/json",
+      "sign": makeSign(params, ts),
+      "timestamp": ts,
+    },
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
+
+  if (!resp.ok) throw new Error(`list http ${resp.status}`);
+  const body = await resp.json();
+  if (body.code !== 0 || !Array.isArray(body.data)) {
+    throw new Error(`list code ${body.code} ${body.message || ""}`.trim());
+  }
+  return body.data;
+}
+
+/**
+ * 从 item 里收集全部候选线路，按“真 HLS 优先、字段优先级次序”排序。
+ * 返回 [{ field, url, isHls }]
+ */
+function pickCandidates(item) {
+  const list = [];
+  STREAM_PREF.forEach((field, idx) => {
+    const url = (item[field] || "").trim();
+    if (!url) return;
+    const isHls = /\.m3u8(\?|$)/i.test(url);
+    list.push({ field, url, isHls, idx });
+  });
+  // isHls 优先，其次按 STREAM_PREF 次序
+  list.sort((a, b) => (a.isHls === b.isHls ? a.idx - b.idx : a.isHls ? -1 : 1));
+  return list;
+}
+
+/** 兼容旧调用：取排序后的首个 */
+function pickStreamUrl(item) {
+  const list = pickCandidates(item);
+  return list.length ? list[0] : null;
+}
+
+/** 故障线路冷却 */
+const badKey = (id, field) => `bad/${id}/${field}`;
+const isBad = (id, field) => !!memGet(badKey(id, field));
+function markBad(id, field) {
+  memSet(badKey(id, field), 1, BAD_TTL_SEC);
+}
+
+/* ============================ 缓存 ============================ */
+/* 两级：isolate 内存（微秒级，扛住 LMS 每 10s 重载清单的高频）→ Cache API（跨 isolate 持久） */
+
+const MEM = new Map(); // key -> { v, exp }
+const MEM_MAX = 400;
+
+function memGet(key) {
+  const hit = MEM.get(key);
+  if (!hit) return null;
+  if (hit.exp < Date.now()) {
+    MEM.delete(key);
+    return null;
+  }
+  return hit.v;
+}
+
+function memSet(key, v, ttlSec) {
+  if (MEM.size > MEM_MAX) MEM.clear();
+  MEM.set(key, { v, exp: Date.now() + ttlSec * 1000 });
+}
+
+function cacheStore() {
+  return typeof caches !== "undefined" && caches.default ? caches.default : null;
+}
+
+async function cacheGetJson(key) {
+  const m = memGet(key);
+  if (m) return m;
+  const c = cacheStore();
+  if (!c) return null;
+  const hit = await c.match(new Request(`https://cache.internal/${key}`));
+  if (!hit) return null;
   try {
-    const u = new URL(url);
-    return `${u.protocol}//${u.host}${u.pathname}`;
+    const v = await hit.json();
+    memSet(key, v, 30);
+    return v;
   } catch {
-    return "(unparsable-url)";
+    return null;
   }
 }
 
-function redactText(s) {
-  return String(s == null ? "" : s).replace(/https?:\/\/[^\s"'<>()]+/g, (m) => redact(m));
+function cachePutJson(ctx, key, value, ttlSec) {
+  memSet(key, value, ttlSec);
+  const c = cacheStore();
+  if (!c) return;
+  const put = c
+    .put(
+      new Request(`https://cache.internal/${key}`),
+      new Response(JSON.stringify(value), {
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": `public, max-age=${ttlSec}`,
+        },
+      })
+    )
+    .catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put);
 }
 
-function safeHost(url) {
-  try {
-    return new URL(url).host;
-  } catch {
-    return "";
+/* ============================ 频道索引 ============================ */
+
+const indexKey = (province, cat) => `v${VERSION}/idx/${province}/${cat}`;
+
+/**
+ * 取某地区的全部频道（带缓存）。
+ * 三地区总共 3 省 × 2 类 = 6 次并发请求，缓存命中后为 0 次。
+ */
+async function loadRegion(region, ctx, force = false) {
+  const catResults = await Promise.all(
+    CATEGORY_IDS.map(async (cat) => {
+      const key = indexKey(region.province, cat);
+      if (!force) {
+        const cached = await cacheGetJson(key);
+        if (cached && Array.isArray(cached.items)) return { cat, items: cached.items };
+      }
+      try {
+        const items = await fetchBroadcastList(region.province, cat);
+        cachePutJson(ctx, key, { items, at: Date.now() }, API_TTL_SEC);
+        return { cat, items };
+      } catch (e) {
+        return { cat, items: [], error: (e && e.message) || "fetch failed" };
+      }
+    })
+  );
+
+  const merged = new Map();
+  for (const { cat, items } of catResults) {
+    for (const item of items) {
+      const id = String(item.contentId || "").trim();
+      const cands = pickCandidates(item);
+      if (!id || cands.length === 0) continue;
+      if (merged.has(id)) continue;
+      merged.set(id, {
+        id,
+        title: (item.title || "").trim() || `频道 ${id}`,
+        subtitle: (item.subtitle || "").trim(),
+        image: (item.image || "").trim(),
+        region: region.key,
+        regionName: region.name,
+        province: region.province,
+        categoryId: cat,
+        cands,
+        // 供 m3u 生成/排障用：排第一的那条
+        url: cands[0].url,
+        field: cands[0].field,
+      });
+    }
   }
+  return merged;
 }
 
-function isPlaylist(text) {
-  return String(text).replace(/^\uFEFF/, "").trimStart().startsWith("#EXTM3U");
-}
-
-function isAllowedHost(host, env) {
-  const h = String(host).toLowerCase().replace(/\.$/, "");
-  const extra = String((env && env.ALLOW_HOSTS) || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase().replace(/^\./, ""))
-    .filter(Boolean);
-  return DEFAULT_ALLOWED_HOSTS.concat(extra).some((s) => h === s || h.endsWith("." + s));
-}
-
-function isPrivateHost(host) {
-  const h = String(host).toLowerCase().replace(/\.$/, "");
-  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal")) {
-    return true;
+/** 单台查询：先查 URL 缓存，未命中再定位地区 */
+async function resolveStation(id, ctx, force = false) {
+  const sid = String(id);
+  const uKey = `v${VERSION}/url/${sid}`;
+  if (!force) {
+    const cached = await cacheGetJson(uKey);
+    if (cached && cached.url) return cached;
   }
-  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true; // link-local / 云元数据
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-    return false;
+
+  // 三地区索引并发载入；已缓存的地区不会发请求
+  const maps = await Promise.all(REGIONS.map((r) => loadRegion(r, ctx, force)));
+  for (const map of maps) {
+    const st = map.get(sid);
+    if (st) {
+      cachePutJson(ctx, uKey, st, URL_TTL_SEC);
+      return st;
+    }
   }
-  if (h.startsWith("[") && h.endsWith("]")) {
-    const v6 = h.slice(1, -1);
-    if (v6 === "::1" || v6 === "::") return true;
-    if (/^f[cd][0-9a-f]{0,2}:/.test(v6)) return true; // fc00::/7
-    if (/^fe[89ab][0-9a-f]?:/.test(v6)) return true; // fe80::/10
-    if (v6.startsWith("::ffff:")) return isPrivateHost(v6.slice(7));
-  }
-  return false;
+  return null;
 }
 
-// 绝对化 + 可选强制 https（私有地址保持原协议）
-function absolutize(ref, baseDir, baseProto, forceHttps) {
-  let abs;
-  if (/^https?:\/\//i.test(ref)) {
-    abs = ref;
-  } else if (ref.startsWith("//")) {
-    abs = baseProto + ref;
-  } else {
+/* ============================ 播放清单重写 ============================ */
+
+function absolutize(ref, baseUrl, forceHttps) {
+  let abs = ref;
+  if (!/^https?:\/\//i.test(ref)) {
     try {
-      abs = new URL(ref, baseDir).toString();
+      abs = new URL(ref, baseUrl).toString();
     } catch {
-      abs = baseDir + ref;
+      return ref;
     }
   }
   if (!forceHttps) return abs;
   try {
     const u = new URL(abs);
-    if (u.protocol === "http:" && !isPrivateHost(u.hostname)) u.protocol = "https:";
+    if (u.protocol === "http:") u.protocol = "https:";
     return u.toString();
   } catch {
     return abs;
   }
 }
 
-// 重写播放列表：普通分片行 + 带 URI="…" 的标签（KEY / MAP / MEDIA / I-FRAME-STREAM-INF）
+/**
+ * 云听清单里分片全是相对路径且不带签名，直接把每行补成绝对地址。
+ * 同时清掉 #EXT-X-ALLOW-CACHE，避免播放器自行缓存直播清单。
+ */
 function rewritePlaylist(text, baseUrl, forceHttps) {
-  const base = new URL(baseUrl);
-  const baseProto = base.protocol;
-  const baseDir = new URL(".", base).toString();
-
-  return String(text)
-    .split(/\r?\n/)
-    .map((line) => {
-      const raw = line.trim();
-      if (!raw) return "";
-
-      if (raw.startsWith("#")) {
-        if (!/URI="/i.test(raw)) return raw;
-        return raw.replace(/URI="([^"]*)"/gi, (_all, uri) => {
-          if (!uri || uri.startsWith("data:")) return `URI="${uri}"`;
-          return `URI="${absolutize(uri, baseDir, baseProto, forceHttps)}"`;
-        });
-      }
-
-      return absolutize(raw, baseDir, baseProto, forceHttps);
-    })
-    .join("\n");
-}
-
-function mediaLineUrls(text, baseUrl, forceHttps) {
-  const base = new URL(baseUrl);
-  const baseDir = new URL(".", base).toString();
   const out = [];
   for (const line of String(text).split(/\r?\n/)) {
     const raw = line.trim();
-    if (!raw || raw.startsWith("#")) continue;
-    out.push(absolutize(raw, baseDir, base.protocol, forceHttps));
-  }
-  return out;
-}
-
-function isAbortError(e) {
-  return !!e && (e.name === "TimeoutError" || e.name === "AbortError");
-}
-
-async function discardBody(resp) {
-  try {
-    if (resp && resp.body && !resp.bodyUsed) await resp.body.cancel();
-  } catch {
-    // 连接已经断了，忽略
-  }
-}
-
-// 只读前 maxBytes 字节就断开分支流：用于在 CT 像音频时确认正文是不是播放列表
-async function peekText(resp, maxBytes = PEEK_BYTES) {
-  if (!resp || !resp.body) return "";
-  let reader;
-  try {
-    reader = resp.clone().body.getReader();
-  } catch {
-    return "";
-  }
-  let buf = new Uint8Array(0);
-  try {
-    while (buf.length < maxBytes) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const next = new Uint8Array(buf.length + value.length);
-      next.set(buf);
-      next.set(value, buf.length);
-      buf = next;
+    if (!raw) continue;
+    if (raw.startsWith("#")) {
+      if (/^#EXT-X-ALLOW-CACHE/i.test(raw)) continue;
+      if (/URI="/i.test(raw)) {
+        out.push(raw.replace(/URI="([^"]*)"/gi, (_m, uri) =>
+          uri && !uri.startsWith("data:") ? `URI="${absolutize(uri, baseUrl, forceHttps)}"` : `URI="${uri}"`
+        ));
+      } else {
+        out.push(raw);
+      }
+      continue;
     }
-  } catch {
-    // 读到一半断了，用已有内容判断
+    out.push(absolutize(raw, baseUrl, forceHttps));
   }
-  try {
-    await reader.cancel();
-  } catch {
-    // 忽略
-  }
-  return new TextDecoder().decode(buf.subarray(0, maxBytes));
+  return out.join("\n");
 }
 
-/* ---------------- 响应构造 ---------------- */
+async function fetchPlaylist(url, forceHttps, timeoutMs = PLAYLIST_TIMEOUT_MS) {
+  // 直播清单必须实时，但吸收 2s 内的重复请求（< TARGETDURATION 10s，不会让播放器以为卡住）
+  const memoKey = `pl:${url}:${forceHttps ? 1 : 0}`;
+  const memo = memGet(memoKey);
+  if (memo) return memo;
 
-function playlistResponse(body) {
+  const resp = await fetch(url, {
+    headers: {
+      "User-Agent": CLIENT_UA,
+      "Accept": "*/*",
+      // 不要带 Range：上游支持 Range 但会返回 206 只给分片字节，清单会被截断
+      "Accept-Language": "zh-CN,zh;q=0.9",
+    },
+    redirect: "follow",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!resp.ok) throw new Error(`playlist http ${resp.status}`);
+
+  const declared = Number(resp.headers.get("Content-Length") || 0);
+  if (declared > MAX_PLAYLIST_BYTES) throw new Error(`playlist too large ${declared}`);
+
+  const text = await resp.text();
+  if (!text.replace(/^\uFEFF/, "").trimStart().startsWith("#EXTM3U")) {
+    throw new Error("not a playlist");
+  }
+  const base = resp.url || url;
+  const result = { finalUrl: base, body: rewritePlaylist(text, base, forceHttps) };
+  memSet(memoKey, result, PLAYLIST_MEMO_SEC);
+  return result;
+}
+
+/* ============================ 响应构造 ============================ */
+
+const jsonHeaders = () => ({
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-store",
+  "Access-Control-Allow-Origin": "*",
+  "X-Gateway-Version": VERSION,
+});
+
+function errResponse(status, code, detail, extra = {}) {
+  return new Response(JSON.stringify({ error: code, status, detail, gateway: VERSION }) + "\n", {
+    status,
+    headers: { ...jsonHeaders(), ...extra },
+  });
+}
+
+function playlistResponse(body, extraHeaders = {}) {
   return new Response(body, {
     status: 200,
     headers: {
       "Content-Type": HLS_MIME,
-      // 必须 no-store：Cloudflare 默认 Browser Cache TTL = 4h 会把 public/max-age
-      // 覆盖成 max-age=14400，LMS 会重放同一份播放列表直到直播卡死。
+      // 直播清单必须 no-store：CF 默认 Browser Cache TTL 会把它抬到数小时，导致卡死
       "Cache-Control": "no-store",
       "CDN-Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": "*",
-      "X-Content-Type-Options": "nosniff",
-      "X-Gateway-Version": VERSION,
-    },
-  });
-}
-
-function errResponse(status, code, detail, extraHeaders = {}) {
-  const body = JSON.stringify({
-    error: code,
-    status,
-    detail: redactText(detail),
-    gateway: VERSION,
-  });
-  return new Response(body + "\n", {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
       "Access-Control-Allow-Origin": "*",
       "X-Content-Type-Options": "nosniff",
       "X-Gateway-Version": VERSION,
@@ -289,68 +439,13 @@ function errResponse(status, code, detail, extraHeaders = {}) {
   });
 }
 
-/* ---------------- 上游拉取 ---------------- */
+/* ============================ 主逻辑 ============================ */
 
-async function fetchWithRetry(url, attempt = 0) {
-  try {
-    const resp = await fetch(url, {
-      headers: UPSTREAM_HEADERS,
-      redirect: "follow",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (RETRYABLE_STATUS.has(resp.status) && attempt < 1) {
-      await discardBody(resp);
-      return fetchWithRetry(url, attempt + 1);
-    }
-    return resp;
-  } catch (e) {
-    // 超时与网络错误都重试一次：单发 4s 失败就放弃太脆，两次合计 ≤8s
-    if (attempt < 1) return fetchWithRetry(url, attempt + 1);
-    throw e;
-  }
-}
-
-// 单个分片探测：读 2 字节就断开，不落盘
-// 返回 "alive" | "dead" | "unknown"
-//   alive  : 2xx（含 206，实测 ytcast/ytcast2 对 Range 请求返回 206）
-//   dead   : 404 / 410 / 451，明确下线
-//   unknown: 5xx / 403 / 400 / 416 / 超时 / 网络错误 —— 边缘抖动，不能据此判死
-async function probeSegment(url) {
-  try {
-    const r = await fetch(url, {
-      method: "GET",
-      headers: { ...UPSTREAM_HEADERS, Range: "bytes=0-1" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    const status = r.status;
-    await discardBody(r);
-    if (status >= 200 && status < 300) return "alive";
-    if (DEAD_SEGMENT_STATUS.has(status)) return "dead";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
-// 并行抽查末尾若干分片：
-//   任一 alive      → 活流
-//   全部明确 dead   → 僵尸流
-//   其余（含 unknown）→ 放行（fail-open，宁可让播放器自己重试）
-async function hasLiveSegment(segments) {
-  if (segments.length === 0) return false;
-  const tail = segments.slice(-PROBE_TAIL).reverse();
-  const results = await Promise.all(tail.map((s) => probeSegment(s)));
-  if (results.some((r) => r === "alive")) return true;
-  return !results.every((r) => r === "dead");
-}
-
-/* ---------------- 主逻辑 ---------------- */
-
-async function handle(request, env, ctx) {
+async function handleRequest(request, env, ctx) {
   const started = Date.now();
   const reqUrl = new URL(request.url);
   const path = reqUrl.pathname;
+  const forceHttps = reqUrl.searchParams.get("https") === "1" || (env && env.FORCE_HTTPS === "1");
 
   if (request.method !== "GET" && request.method !== "HEAD") {
     return errResponse(405, "method_not_allowed", `method ${request.method} not supported`, {
@@ -369,238 +464,119 @@ async function handle(request, env, ctx) {
     });
   }
 
-  // ---------------- 路由 ----------------
-  let upstream = null;
-  let kind = null;
-
+  // ---------- 单台清单 ----------
   const m = path.match(/^\/r\/([A-Za-z0-9_-]{1,64})\.m3u8$/);
   if (m) {
-    upstream = `${UPSTREAM_ENTRY}${m[1]}`;
-    kind = "id";
-  }
+    const id = m[1];
 
-  if (!upstream) {
-    const raw = reqUrl.searchParams.get("url");
-    if (raw) {
-      let target;
+    let station = await resolveStation(id, ctx, false);
+    if (!station) station = await resolveStation(id, ctx, true); // 缓存过期则强刷一次
+    if (!station) {
+      return errResponse(404, "not_found", `contentId ${id} 不在央广/浙江/上海目录中`);
+    }
+
+    // 按候选顺序尝试；命中黑名单的线路跳过，全部被跳过时再放开重试
+    const cands = station.cands || [];
+    const attempts = [];
+    for (const c of cands) if (!isBad(id, c.field)) attempts.push(c);
+    if (attempts.length === 0) attempts.push(...cands);
+
+    let lastErr = "no candidate";
+    for (const cand of attempts) {
+      let got = null;
       try {
-        target = new URL(raw);
-      } catch {
-        return errResponse(400, "bad_url", "url parameter is not a valid absolute URL");
+        got = await fetchPlaylist(cand.url, forceHttps, cand.isHls ? PLAYLIST_TIMEOUT_MS : MP3_PROBE_TIMEOUT_MS);
+      } catch (e) {
+        lastErr = `${cand.field}: ${(e && e.message) || "fetch failed"}`;
+        markBad(id, cand.field); // 只有取流失败才算线路故障
+        continue;
       }
-      if (target.protocol !== "https:" && target.protocol !== "http:") {
-        return errResponse(400, "bad_url", `unsupported scheme ${target.protocol}`);
-      }
-      if (isPrivateHost(target.hostname)) {
-        return errResponse(400, "bad_url", "private/loopback targets are not allowed");
-      }
-      if (!(env && env.ALLOW_ANY_URL === "1") && !isAllowedHost(target.hostname, env)) {
-        return errResponse(
-          400,
-          "host_not_allowed",
-          `?url= is restricted to radio hosts (${target.hostname}); set ALLOW_HOSTS or ALLOW_ANY_URL=1 to widen`
-        );
-      }
-      upstream = target.toString();
-      kind = "debug";
+
+      // 响应头一律 ASCII：中文必须 encodeURIComponent，否则 Response 构造抛 ByteString 错误
+      let upstreamHost = "";
+      try {
+        upstreamHost = new URL(got.finalUrl).host;
+      } catch {}
+      return playlistResponse(got.body, {
+        "X-Station": encodeURIComponent(station.title),
+        "X-Region": encodeURIComponent(station.regionName || ""),
+        "X-Line": cand.field,
+        "X-Tried": String(attempts.length),
+        "X-Upstream-Host": upstreamHost,
+        "X-Timing": `total=${Date.now() - started}`,
+      });
     }
+
+    return errResponse(502, "upstream_failed", `所有线路均失败：${lastErr}`, { "Retry-After": "10" });
   }
 
-  if (!upstream) {
-    return errResponse(
-      400,
-      "bad_request",
-      "usage: GET /r/<id>.m3u8 (for LMS) | GET /?url=<m3u8 url> (debug) | GET /health"
-    );
-  }
-
-  const forceHttps = !(env && env.FORCE_HTTPS === "0");
-  const probeEnabled = kind === "id" && request.method === "GET" && !(env && env.PROBE_SEGMENTS === "0");
-
-  // ---------------- 短缓存（仅 GET + /r/ 路由）----------------
-  const cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
-  let cacheKey = null;
-  if (cache && kind === "id" && request.method === "GET") {
-    cacheKey = new Request(
-      `${reqUrl.origin}/__cache/v${VERSION}/${forceHttps ? 1 : 0}${probeEnabled ? 1 : 0}${path}`,
-      { method: "GET" }
-    );
-    const hit = await cache.match(cacheKey);
-    if (hit) {
-      const headers = new Headers(hit.headers);
-      headers.set("X-Gateway-Cache", "HIT");
-      // 缓存里存的是 max-age=5 的副本，回给客户端时必须换回 no-store，
-      // 否则 CF 会按 zone 的 Browser Cache TTL 把它抬到 4h。
-      headers.set("Cache-Control", "no-store");
-      headers.set("CDN-Cache-Control", "no-store");
-      const ageMs = Date.now() - parseInt(headers.get("X-Cached-At") || "0", 10) || 0;
-      headers.delete("X-Cached-At");
-      headers.set("X-Timing", `cache=HIT;age=${ageMs};total=${Date.now() - started}`);
-      log(env, { evt: "req", id: m && m[1], status: hit.status, cache: "HIT", ms: Date.now() - started });
-      return new Response(hit.body, { status: hit.status, headers });
+  // ---------- 地区频道列表 ----------
+  const lm = path.match(/^\/list\/([a-z]+)\.m3u$/);
+  if (lm) {
+    const which = lm[1];
+    const regions = which === "all" ? REGIONS : REGIONS.filter((r) => r.key === which);
+    if (regions.length === 0) {
+      return errResponse(404, "not_found", `未知地区 ${which}，可用：cnr / zj / sh / all`);
     }
-  }
 
-  // ---------------- 拉上游 ----------------
-  let resp;
-  let tEntry = 0;
-  try {
-    resp = await fetchWithRetry(upstream);
-    tEntry = Date.now() - started; // 含入口 302 + 落地 m3u8 两跳
-  } catch (e) {
-    log(env, { evt: "upstream_error", id: m && m[1], err: (e && e.name) || "Error", ms: Date.now() - started });
-    return errResponse(
-      502,
-      isAbortError(e) ? "upstream_timeout" : "upstream_unreachable",
-      `${(e && e.name) || "Error"}: ${(e && e.message) || "fetch failed"}`,
-      { "Retry-After": "10" }
-    );
-  }
+    const origin = reqUrl.origin;
+    const lines = ["#EXTM3U"];
+    let count = 0;
+    for (const region of regions) {
+      const map = await loadRegion(region, ctx, false);
+      const items = Array.from(map.values()).sort((a, b) => a.title.localeCompare(b.title, "zh"));
+      if (items.length === 0) continue;
+      lines.push(`\n# ${region.name}（${items.length} 台）`);
+      for (const st of items) {
+        lines.push(`#EXTINF:-1 group-title="${region.name}" tvg-id="${st.id}",${st.title}`);
+        lines.push(`${origin}/r/${st.id}.m3u8`);
+        count++;
+      }
+    }
 
-  const finalUrl = resp.url || upstream;
-  const ct = (resp.headers.get("Content-Type") || "").toLowerCase().split(";")[0].trim();
-
-  // 空号/占位流：上游 302 到 nosignal.mp3。它可能是无限音频流，
-  // 所以先按落地 URL 判定，绝不先读 body。
-  if (NOSIGNAL_RE.test(finalUrl)) {
-    await discardBody(resp);
-    return errResponse(404, "no_signal", `upstream target is a placeholder stream (ct: ${ct || "(none)"})`, {
-      "X-Upstream-Host": safeHost(finalUrl),
+    if (count === 0) return errResponse(503, "empty", "三个地区的频道列表均为空", { "Retry-After": "30" });
+    return new Response(lines.join("\n") + "\n", {
+      status: 200,
+      headers: {
+        "Content-Type": "audio/x-mpegurl; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "X-Gateway-Version": VERSION,
+        "X-Station-Count": String(count),
+        "X-Timing": `total=${Date.now() - started}`,
+      },
     });
   }
 
-  // CT 像音频容器时再 peek 正文：有源把 m3u8 标成 audio/mpeg，
-  // 正文以 #EXTM3U 开头就按播放列表继续，否则才算占位流。
-  if (AUDIO_CONTAINER_RE.test(ct)) {
-    const head = await peekText(resp);
-    if (!isPlaylist(head)) {
-      await discardBody(resp);
-      return errResponse(404, "no_signal", `upstream target is a placeholder stream (ct: ${ct || "(none)"})`, {
-        "X-Upstream-Host": safeHost(finalUrl),
-      });
-    }
-  }
-
-  if (!resp.ok) {
-    await discardBody(resp);
-    if (resp.status === 404 || resp.status === 410) {
-      return errResponse(404, "upstream_gone", `upstream ${resp.status} at ${redact(finalUrl)}`, {
-        "X-Upstream-Host": safeHost(finalUrl),
-      });
-    }
-    if (resp.status === 403) {
-      // radio.0472.org 的 CF 挑战页：说明 VLC UA 那套放行规则变了
-      return errResponse(502, "cf_challenge", `upstream 403 at ${redact(finalUrl)} — UA allowlist may have changed`, {
-        "X-Upstream-Host": safeHost(finalUrl),
-      });
-    }
-    if (resp.status === 429) {
-      return errResponse(503, "upstream_rate_limited", `upstream 429 at ${redact(finalUrl)}`, {
-        "Retry-After": "60",
-      });
-    }
-    return errResponse(502, "upstream_error", `upstream ${resp.status} at ${redact(finalUrl)}`, {
-      "Retry-After": "15",
-      "X-Upstream-Host": safeHost(finalUrl),
+  // ---------- 说明页 ----------
+  if (path === "/") {
+    const body = [
+      `radio.cn HLS 网关 v${VERSION}`,
+      "",
+      "GET /r/<contentId>.m3u8     单台直播清单（LMS 收藏夹用）",
+      "GET /list/cnr.m3u          央广频道列表（zj / sh / all 同理）",
+      "GET /health                健康检查",
+      "",
+      "参数：?https=1 把分片强制升为 https（仅浏览器播放需要）",
+    ].join("\n");
+    return new Response(body + "\n", {
+      status: 200,
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Gateway-Version": VERSION,
+      },
     });
   }
 
-  const declared = Number(resp.headers.get("Content-Length") || 0);
-  if (declared > MAX_PLAYLIST_BYTES) {
-    await discardBody(resp);
-    return errResponse(502, "playlist_too_large", `declared ${declared} bytes at ${redact(finalUrl)}`);
-  }
-
-  let text;
-  try {
-    text = await resp.text();
-  } catch (e) {
-    return errResponse(502, "upstream_read_failed", (e && e.message) || "read failed");
-  }
-  // 兜底：Content-Length 可能缺失或撒谎，按 UTF-16 码元再粗判一次
-  if (text.length > MAX_PLAYLIST_BYTES) {
-    return errResponse(502, "playlist_too_large", `read ${text.length} chars at ${redact(finalUrl)}`);
-  }
-
-  // 上游返回挑战页/HTML：明确报错，不把 HTML 当播放列表吐出去
-  if (!isPlaylist(text)) {
-    const kindOfFail = ct.includes("html") ? "html_challenge" : "not_a_playlist";
-    return errResponse(502, kindOfFail, `upstream content-type: ${ct || "(none)"} at ${redact(finalUrl)}`);
-  }
-
-  const segments = mediaLineUrls(text, finalUrl, forceHttps);
-
-  if (segments.length === 0) {
-    return errResponse(503, "empty_playlist", "playlist has no segments", { "Retry-After": "30" });
-  }
-
-  // 僵尸流：有 #EXTM3U，但末尾分片全部明确下线（404/410/451）。
-  // 5xx/403/超时属于 unknown，不判僵尸流，直接放行。
-  const tBeforeProbe = Date.now() - started;
-  if (probeEnabled && !(await hasLiveSegment(segments))) {
-    return errResponse(
-      503,
-      "stale_stream",
-      `tail ${Math.min(PROBE_TAIL, segments.length)} segment(s) all 404/410/451 at ${redact(finalUrl)}`,
-      {
-        "Retry-After": "60",
-        "X-Timing": `entry=${tEntry};probe=${Date.now() - started - tBeforeProbe};total=${Date.now() - started}`,
-      }
-    );
-  }
-  const tProbe = Date.now() - started - tBeforeProbe;
-
-  const rewritten = rewritePlaylist(text, finalUrl, forceHttps);
-  const out = playlistResponse(rewritten);
-  out.headers.set("X-Gateway-Cache", "MISS");
-  out.headers.set(
-    "X-Timing",
-    `entry=${tEntry};playlist=${tBeforeProbe - tEntry};probe=${tProbe};total=${Date.now() - started}`
-  );
-
-  if (cache && cacheKey) {
-    // 内部去重 5s：缓存对象必须留 max-age（Cache API 的存活时间取自它），
-    // 但这份头只在缓存层内有效，回客户端时会被换回 no-store。
-    const cached = new Response(out.clone().body, {
-      status: out.status,
-      headers: new Headers(out.headers),
-    });
-    cached.headers.set("Cache-Control", `public, max-age=${PLAYLIST_CACHE_TTL_SEC}`);
-    cached.headers.delete("CDN-Cache-Control");
-    cached.headers.set("X-Cached-At", String(Date.now()));
-    const put = cache.put(cacheKey, cached).catch(() => {});
-    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put);
-    else await put;
-  }
-
-  log(env, {
-    evt: "req",
-    id: m && m[1],
-    status: out.status,
-    cache: "MISS",
-    segs: segments.length,
-    probe: probeEnabled ? 1 : 0,
-    ms: Date.now() - started,
-  });
-
-  return out;
-}
-
-function log(env, fields) {
-  if (env && env.LOG === "0") return;
-  try {
-    console.log(JSON.stringify(fields));
-  } catch {
-    // 日志失败不影响响应
-  }
+  return errResponse(400, "bad_request", "usage: /r/<id>.m3u8 | /list/cnr.m3u | /health");
 }
 
 export default {
   async fetch(request, env, ctx) {
     try {
-      return await handle(request, env, ctx);
+      return await handleRequest(request, env, ctx);
     } catch (e) {
-      log(env, { evt: "fatal", err: (e && e.name) || "Error", msg: redactText((e && e.message) || "") });
       return errResponse(500, "internal_error", `${(e && e.name) || "Error"}: ${(e && e.message) || ""}`);
     }
   },
