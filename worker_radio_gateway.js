@@ -30,7 +30,7 @@
  *   GET /                     说明
  */
 
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 
 /* ============================ 可调配置 ============================ */
 
@@ -376,7 +376,79 @@ function rewritePlaylist(text, baseUrl, forceHttps) {
   return out.join("\n");
 }
 
-async function fetchPlaylist(url, forceHttps, timeoutMs = PLAYLIST_TIMEOUT_MS) {
+/* ============================ HLS 序列号归一化 ============================ */
+/*
+ * PlayHLS 的 _parsePL 用 `if ($1 < _media_sequence_no)` 判 Broken media sequence，
+ * 且只有 `chunknum > _played` 的分片才会入队（HLSPLAY.pm:363）。
+ * 上游源重启时（分片时间基变化）MEDIA-SEQUENCE 会整体回退（实测 632 → 273），
+ * 于是新分片全被过滤 → 队列为空 → chunkref 变 undef →
+ * HLSPLAY.pm:582 `length($$chunkref)` 抛 "Can't use an undefined value as a SCALAR reference"
+ * → sendStreamingResponse 异常 → 推给播放器的音频 HTTP 流中断。
+ * 而 LMS 播放状态机不会切 stop，界面停在"正在播放"，实际一个字节都没输出。
+ *
+ * 对策：对外只暴露单调不减的 MEDIA-SEQUENCE。
+ *   - 首次见到某台：用分片名里的时间基（segment<YYYYMMDDhhmmss>-<n>）算出绝对序号做基线，
+ *     这样网关重启后也不会回退；
+ *   - 之后只搬运上游增量（raw - lastRaw），上游回退时前进一步；
+ *   - 上游未变化时保持不动，避免同一份清单被多次请求时序号虚涨。
+ * 分片 URL 仍用上游真实地址，PlayHLS 不按序号推算 URL，改序号是安全的。
+ */
+const SEQ = new Map(); // stationId -> { raw, out }
+const SEQ_MAX = 1000;
+
+function absoluteSeq(text, targetDuration) {
+  // radio.cn 分片名：segment20261113030703-00000315.ts（前 14 位＝该流实例的启动时刻）
+  const m = text.match(/segment(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})-(\d+)/);
+  if (!m) return null;
+  const base = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  const idx = Number(m[7]);
+  if (!Number.isFinite(base) || !Number.isFinite(idx)) return null;
+  // 时间基只是做单调锚点，时区偏差是常量，不影响单调性
+  return Math.floor(base / (targetDuration * 1000)) + idx;
+}
+
+function normalizeSequence(id, text) {
+  const mSeq = text.match(/^#EXT-X-MEDIA-SEQUENCE:(\d+)\s*$/im);
+  if (!mSeq) return { body: text, seq: null };
+
+  const raw = Number(mSeq[1]);
+  const td = Number((text.match(/^#EXT-X-TARGETDURATION:(\d+)/im) || [])[1]) || 10;
+  const prev = SEQ.get(id);
+
+  let out;
+  let mode;
+  if (!prev) {
+    const abs = absoluteSeq(text, td);
+    if (abs !== null && abs > raw) {
+      out = abs;
+      mode = "anchor";
+    } else {
+      out = raw;
+      mode = "init";
+    }
+  } else if (raw > prev.raw) {
+    out = prev.out + (raw - prev.raw);
+    mode = "carry";
+  } else if (raw < prev.raw) {
+    out = prev.out + 1;
+    mode = "reset";
+  } else {
+    out = prev.out;
+    mode = "hold";
+  }
+
+  // 超限清空是安全的：清空后各台都走 anchor 分支，仍然单调
+  if (SEQ.size > SEQ_MAX) SEQ.clear();
+  SEQ.set(id, { raw, out });
+
+  let body = text;
+  if (out !== raw) {
+    body = text.replace(/^#EXT-X-MEDIA-SEQUENCE:\d+\s*$/im, `#EXT-X-MEDIA-SEQUENCE:${out}`);
+  }
+  return { body, seq: { raw, out, mode } };
+}
+
+async function fetchPlaylist(url, forceHttps, timeoutMs = PLAYLIST_TIMEOUT_MS, seqKey = null) {
   // 直播清单必须实时，但吸收 2s 内的重复请求（< TARGETDURATION 10s，不会让播放器以为卡住）
   const memoKey = `pl:${url}:${forceHttps ? 1 : 0}`;
   const memo = memGet(memoKey);
@@ -402,7 +474,9 @@ async function fetchPlaylist(url, forceHttps, timeoutMs = PLAYLIST_TIMEOUT_MS) {
     throw new Error("not a playlist");
   }
   const base = resp.url || url;
-  const result = { finalUrl: base, body: rewritePlaylist(text, base, forceHttps) };
+  const rewritten = rewritePlaylist(text, base, forceHttps);
+  const norm = seqKey ? normalizeSequence(seqKey, rewritten) : { body: rewritten, seq: null };
+  const result = { finalUrl: base, body: norm.body, seq: norm.seq };
   memSet(memoKey, result, PLAYLIST_MEMO_SEC);
   return result;
 }
@@ -485,7 +559,12 @@ async function handleRequest(request, env, ctx) {
     for (const cand of attempts) {
       let got = null;
       try {
-        got = await fetchPlaylist(cand.url, forceHttps, cand.isHls ? PLAYLIST_TIMEOUT_MS : MP3_PROBE_TIMEOUT_MS);
+        got = await fetchPlaylist(
+          cand.url,
+          forceHttps,
+          cand.isHls ? PLAYLIST_TIMEOUT_MS : MP3_PROBE_TIMEOUT_MS,
+          id
+        );
       } catch (e) {
         lastErr = `${cand.field}: ${(e && e.message) || "fetch failed"}`;
         markBad(id, cand.field); // 只有取流失败才算线路故障
@@ -504,6 +583,10 @@ async function handleRequest(request, env, ctx) {
         "X-Tried": String(attempts.length),
         "X-Upstream-Host": upstreamHost,
         "X-Timing": `total=${Date.now() - started}`,
+        // 序列号归一化痕迹：raw=上游原值，out=对外值，mode=init/anchor/carry/hold/reset
+        ...(got.seq
+          ? { "X-Seq-Raw": String(got.seq.raw), "X-Seq-Out": String(got.seq.out), "X-Seq-Mode": got.seq.mode }
+          : {}),
       });
     }
 
