@@ -33,7 +33,7 @@ v3.1.0 在 v3.0.0 基础上只增加了一处逻辑：**HLS 序列号归一化**
 - `server.mjs` — Node HTTP ↔ Web Request/Response 适配层
 - `Dockerfile` — node:22-alpine，无 npm install，非 root 运行，带 HEALTHCHECK
 - `docker-compose.yml` — 端口 8787，自动重启
-- `.github/workflows/docker.yml` — buildx 多架构构建并推 GHCR
+- `.github/workflows/build.yml` — buildx 多架构构建并推 GHCR
 
 ## HLS 序列号归一化（v3.1.0）
 
@@ -109,6 +109,19 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 | `GET /` | 用法说明 |
 
 参数：`?https=1` 把分片升为 https（仅浏览器端需要）。
+
+## 镜像标签
+
+| 标签 | 含义 |
+|---|---|
+| `latest` | main 分支最新构建 |
+| `3.1.0` | package.json 里的 version，构建时自动读取，不用手改 workflow |
+| `3.1.0-YYYYMMDD` | 日期快照，一天内多次构建可区分 |
+| `sha-<短sha>` | 精确到提交，回滚用 |
+
+> `3.0.0` 标签已被 3.1.0 那次构建覆盖（当时 workflow 里写死了 `raw,value=3.0.0`），
+> 拉它拿到的是 3.1.0 的镜像。要真正的 v3.0.0 请用 `sha-d3cf89d`。
+> 该写死值已改为从 `package.json` 读取，后续版本不会再覆盖旧标签。
 
 ## 与 Worker 版的差异
 
