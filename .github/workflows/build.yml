@@ -42,6 +42,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 读取版本号
+        id: ver
+        run: echo "v=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+
       - name: 生成标签
         id: meta
         uses: docker/metadata-action@v5
@@ -49,7 +53,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=3.0.0
+            type=raw,value=${{ steps.ver.outputs.v }}
+            type=raw,value=${{ steps.ver.outputs.v }}-{{date 'YYYYMMDD'}},enable={{is_default_branch}}
             type=ref,event=tag
             type=sha,format=short
 
