@@ -1,0 +1,292 @@
+// radio.cn 加签 Worker（?url= 版）
+//
+// 用法（部署后把 <worker地址> 换成实际的 workers.dev 地址）：
+//   https://<worker地址>/?url=http://ytcast2.radio.cn/110/radios/40639/index_40639.m3u8
+//   https://<worker地址>/?url=http://ytcast2.radio.cn/index_40639.m3u8
+//   https://<worker地址>/?url=https://radio.0472.org/?id=639
+// 直接挂流地址就行，不用找台号：Worker 从地址里取出 radioId（如 40639），
+// 实时向 radio.cn 官方 API 要一条刚签好名的同台地址，再 302 跳过去。
+// 签名过期了下次请求就自动换新签。
+// 旧的 ?id=639 写法也还可以用。
+//
+// 原理（已实测验证）：
+//   流地址的签名由 radio.cn 服务端生成，Worker 每次请求都实时调官方 API
+//   （GET https://ytmsout.radio.cn/web/appBroadcast/list）取最新带签名的地址。
+//   API 调用的签名方法来自 radio.cn 官网播放器公开的 api.js：
+//   sign = MD5(参数按 key 排序拼成 k=v&... + '&timestamp=' + 毫秒时间戳
+//          + '&key=' + SIGN_KEY) 再转大写，放进请求头 timestamp / sign，
+//   请求头还要带 equipmentId: 0000 和 platformCode: WEB。
+//   API 返回的 mp3PlayUrlHigh 就是带签名的流地址，和 radio.0472.org
+//   跳转过去的地址是同一套。
+//
+// 密钥：按用户要求直接写在代码里（radio.cn 官网播放器公开的 key，
+// 不是私人凭证；部署时只需 wrangler deploy，不用再设 secret）。
+// 如以后想改走 secret，把下面这行删掉并用 wrangler secret put SIGN_KEY，
+// 代码里 env.SIGN_KEY 有值时会优先用它。
+const SIGN_KEY = "f0fc4c668392f9f9a447e48584c214ee";
+
+const API_BASE = "https://ytmsout.radio.cn";
+const FALLBACK_PROXY = "https://radio.0472.org/";
+
+// 台站表（?id= 兼容用）：id -> 说明
+// province: "" = 全国台（调 API 时不带参数）；数字 = 地方台的 provinceCode
+// fallback: true = radio.cn 网页 API 里查不到这台，回落到 0472 代理
+// direct: 静态直链地址，无需加签，直接跳转
+const STATIONS = {
+  "639":  { name: "中国之声",         province: "" },
+  "640":  { name: "经济之声",         province: "" },
+  "641":  { name: "音乐之声",         province: "" },
+  "642":  { name: "经典音乐广播",     province: "" },
+  "648":  { name: "文艺之声",         province: "" },
+  "653":  { name: "中国交通广播",     province: "" },
+  "692":  { name: "环球资讯广播",     province: "" },
+  "354":  { name: "北京交通广播",     province: "110000" },
+  "849":  { name: "上海新闻广播",     province: "310000" },
+  "1312": { name: "上海交通广播",     province: "310000" },
+  "493":  { name: "广东珠江经济台",   province: "440000" },
+  "459":  { name: "浙江之声",         province: "330000" },
+  // radio.cn 网页 API 不返回这两台（北京新闻广播、轻松调频），暂回落到 0472
+  "353":  { name: "北京新闻广播",     fallback: true },
+  "689":  { name: "轻松调频 Easy FM", fallback: true },
+  // 直链，无需加签
+  "hitfm": { name: "CRI HIT FM（广州）", direct: "https://satellitepull.cnr.cn/live/wxhitfm/playlist.m3u8" },
+};
+
+// radioId -> { contentId, province }，由台站表自动生成。
+// radioId 是流地址文件名里的数字，如 index_40639.m3u8 -> 40639，
+// stream_20849.mp3 -> 20849；同一台的不同清晰度只是前缀不同。
+const BY_RADIO_ID = {};
+function regRadioIds(contentId, province, prefixes) {
+  for (const p of prefixes) BY_RADIO_ID[p + contentId] = { contentId, province };
+}
+regRadioIds("639", "", ["10", "30", "40"]);
+regRadioIds("640", "", ["10", "30", "40"]);
+regRadioIds("641", "", ["10", "30", "40"]);
+regRadioIds("642", "", ["10", "30", "40"]);
+regRadioIds("648", "", ["10", "30", "40"]);
+regRadioIds("653", "", ["10", "30", "40"]);
+regRadioIds("692", "", ["10", "30", "40"]);
+regRadioIds("354", "110000", ["10", "110", "220"]);
+regRadioIds("849", "310000", ["10", "20"]);
+regRadioIds("1312", "310000", ["1", "2"]);
+regRadioIds("493", "440000", ["10", "110", "220"]);
+regRadioIds("459", "330000", ["10", "110", "220"]);
+// API 里没有的台：直接回落到 0472
+BY_RADIO_ID["220353"] = { contentId: "353", fallback: true };
+BY_RADIO_ID["20689"] = { contentId: "689", fallback: true };
+
+// 全国 + 全部 31 个省/自治区/直辖市的 provinceCode（未知 radioId 回查时用）
+const ALL_PROVINCES = ["", "340000", "110000", "500000", "350000", "620000", "440000",
+  "450000", "520000", "460000", "130000", "410000", "230000", "420000", "430000",
+  "220000", "320000", "360000", "210000", "150000", "640000", "630000", "370000",
+  "140000", "610000", "310000", "510000", "540000", "650000", "660000", "530000",
+  "330000"];
+
+// ---------- MD5（RFC 1321 纯 JS 实现，Workers 自带 Web Crypto 没有 MD5） ----------
+function md5(input) {
+  const utf8 = new TextEncoder().encode(input);
+  const bitLen = utf8.length * 8;
+  // padding: 0x80, then zeros, then 64-bit little-endian length
+  const withPad = new Uint8Array((((utf8.length + 9 + 63) >> 6) << 6));
+  withPad.set(utf8);
+  withPad[utf8.length] = 0x80;
+  const dv = new DataView(withPad.buffer);
+  dv.setUint32(withPad.length - 8, bitLen >>> 0, true);
+  dv.setUint32(withPad.length - 4, Math.floor(bitLen / 0x100000000), true);
+
+  const S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+             5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+             4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+             6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+  const K = [0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a,
+             0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+             0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340,
+             0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+             0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8,
+             0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+             0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+             0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+             0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92,
+             0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+             0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391];
+  const rl = (x, c) => (x << c) | (x >>> (32 - c));
+  const add = (x, y) => {
+    const l = (x & 0xffff) + (y & 0xffff);
+    const m = (x >> 16) + (y >> 16) + (l >> 16);
+    return (m << 16) | (l & 0xffff);
+  };
+
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const M = new Uint32Array(16);
+  for (let off = 0; off < withPad.length; off += 64) {
+    for (let i = 0; i < 16; i++) M[i] = dv.getUint32(off + i * 4, true);
+    let a = a0, b = b0, c = c0, d = d0;
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16)      { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d;           g = (3 * i + 5) % 16; }
+      else             { f = c ^ (b | ~d);        g = (7 * i) % 16; }
+      const tmp = d;
+      d = c;
+      c = b;
+      b = add(b, rl(add(add(a, f), add(K[i], M[g])), S[i]));
+      a = tmp;
+    }
+    a0 = add(a0, a); b0 = add(b0, b); c0 = add(c0, c); d0 = add(d0, d);
+  }
+  const hex = (n) => {
+    let s = "";
+    for (let i = 0; i < 4; i++) s += ("0" + ((n >> (i * 8)) & 0xff).toString(16)).slice(-2);
+    return s;
+  };
+  return hex(a0) + hex(b0) + hex(c0) + hex(d0);
+}
+
+// ---------- 调 radio.cn API 取某省的台站列表（带实时签名） ----------
+async function fetchStationList(province, signKey) {
+  const tm = Date.now().toString();
+  const params = province ? { provinceCode: province } : {};
+  const query = Object.keys(params).sort().map((k) => k + "=" + params[k]).join("&");
+  const signText = (query ? query + "&" : "") + "timestamp=" + tm + "&key=" + signKey;
+  const sign = md5(signText).toUpperCase();
+  const url = API_BASE + "/web/appBroadcast/list" + (query ? "?" + query : "");
+  const res = await fetch(url, {
+    headers: {
+      "Content-Type": "application/json",
+      "equipmentId": "0000",
+      "platformCode": "WEB",
+      "timestamp": tm,
+      "sign": sign,
+    },
+  });
+  if (!res.ok) throw new Error("radio.cn API HTTP " + res.status);
+  const data = await res.json();
+  if (data.code !== 0) throw new Error("radio.cn API code " + data.code + " " + (data.message || ""));
+  return data.data || [];
+}
+
+// 从一条台站记录里挑出文件名带指定 radioId 的那个地址
+// （如 radioId=40639 -> mp3PlayUrlHigh 的 index_40639.m3u8；
+//   radioId=20849 -> mp3PlayUrlHigh 的 stream_20849.mp3）
+function pickField(station, radioId) {
+  const re = new RegExp("(?:index_|stream_)" + radioId + "\\.(?:m3u8|mp3)");
+  for (const f of ["mp3PlayUrlHigh", "playUrlMulti", "playUrlLow", "mp3PlayUrlLow"]) {
+    if (station[f] && re.test(station[f])) return station[f];
+  }
+  return "";
+}
+
+function pickStreamUrl(station) {
+  return station.mp3PlayUrlHigh || station.playUrlMulti ||
+         station.playUrlLow || station.mp3PlayUrlLow || "";
+}
+
+function indexPage(origin) {
+  const rows = Object.entries(STATIONS).map(([id, st]) =>
+    `<li>${st.name} <code>/?id=${id}</code></li>`
+  ).join("\n");
+  const html = `<!doctype html><meta charset="utf-8"><title>radio.cn 加签 Worker</title>
+<h1>radio.cn 加签 Worker</h1>
+<form method="get" action="/">
+<input type="text" name="url" size="80" placeholder="粘贴流地址，如 http://ytcast2.radio.cn/110/radios/40639/index_40639.m3u8">
+<input type="submit" value="播放">
+</form>
+<p>用法：<code>/?url=流地址</code>，每次请求实时向 radio.cn 取最新签名并 302 跳转；旧的 <code>/?id=639</code> 也能用。</p>
+<ul>${rows}</ul>`;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+async function handleId(id, signKey) {
+  const st = STATIONS[id];
+  if (st) {
+    if (st.direct) return Response.redirect(st.direct, 302);
+    if (st.fallback) return Response.redirect(FALLBACK_PROXY + "?id=" + id, 302);
+    try {
+      const list = await fetchStationList(st.province, signKey);
+      const hit = list.find((s) => String(s.contentId) === id);
+      const stream = hit && pickStreamUrl(hit);
+      if (stream) return Response.redirect(stream, 302);
+    } catch (e) {
+      return new Response("radio.cn API 出错：" + e.message, { status: 502 });
+    }
+    return new Response("radio.cn API 里没找到 id=" + id, { status: 404 });
+  }
+  // 未知 id：全国 + 全部省份并行找一圈
+  try {
+    const lists = await Promise.all(
+      ALL_PROVINCES.map((p) => fetchStationList(p, signKey).catch(() => []))
+    );
+    for (const list of lists) {
+      const hit = list.find((s) => String(s.contentId) === id);
+      const stream = hit && pickStreamUrl(hit);
+      if (stream) return Response.redirect(stream, 302);
+    }
+  } catch (e) {
+    return new Response("radio.cn API 出错：" + e.message, { status: 502 });
+  }
+  return new Response("未知 id=" + id, { status: 404 });
+}
+
+async function handleUrl(raw, signKey) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    return new Response("url 参数不是有效地址", { status: 400 });
+  }
+  // 0472 代理地址：直接透传（它自己会再跳一次）
+  if (u.hostname === "radio.0472.org") return Response.redirect(raw, 302);
+  // 非 radio.cn 地址：直接透传（本身就是能播的直链，如 CRI HIT FM 的卫星地址）
+  if (!/\.radio\.cn$/.test(u.hostname)) return Response.redirect(raw, 302);
+
+  // 从文件名取 radioId：index_40639.m3u8 -> 40639；stream_20849.mp3 -> 20849
+  const m = u.pathname.match(/(?:index_|stream_)(\d+)\.(?:m3u8|mp3)/);
+  if (!m) {
+    return new Response("从地址里找不到台号（要 index_XXXX.m3u8 或 stream_XXXX.mp3 这种文件名）", { status: 400 });
+  }
+  const radioId = m[1];
+
+  // 已知 radioId：只调它所在的省
+  const entry = BY_RADIO_ID[radioId];
+  if (entry) {
+    if (entry.fallback) return Response.redirect(FALLBACK_PROXY + "?id=" + entry.contentId, 302);
+    try {
+      const list = await fetchStationList(entry.province, signKey);
+      const hit = list.find((s) => String(s.contentId) === entry.contentId);
+      const stream = hit && pickField(hit, radioId);
+      if (stream) return Response.redirect(stream, 302);
+    } catch (e) {
+      return new Response("radio.cn API 出错：" + e.message, { status: 502 });
+    }
+    return new Response("radio.cn API 里没找到 radioId=" + radioId, { status: 404 });
+  }
+
+  // 未知 radioId：全国 + 全部省份并行找一圈，按文件名匹配地址
+  try {
+    const lists = await Promise.all(
+      ALL_PROVINCES.map((p) => fetchStationList(p, signKey).catch(() => []))
+    );
+    for (const list of lists) {
+      for (const st of list) {
+        const stream = pickField(st, radioId);
+        if (stream) return Response.redirect(stream, 302);
+      }
+    }
+  } catch (e) {
+    return new Response("radio.cn API 出错：" + e.message, { status: 502 });
+  }
+  return new Response("没找到 radioId=" + radioId + "，这个台可能不在 radio.cn 网页 API 里", { status: 404 });
+}
+
+export default {
+  async fetch(request, env) {
+    const signKey = (env && env.SIGN_KEY) || SIGN_KEY;
+    const url = new URL(request.url);
+    const rawUrl = url.searchParams.get("url");
+    if (rawUrl) return handleUrl(rawUrl, signKey);
+    const id = url.searchParams.get("id") || url.pathname.replace(/^\//, "").split("/")[0];
+    if (id) return handleId(id, signKey);
+    return indexPage(url.origin);
+  },
+};
