@@ -1,0 +1,480 @@
+/**
+ * radio.cn 签名 Worker —— 单一职责版
+ * ------------------------------------------------------------------
+ * 只做一件事: 把云听(radio.cn)带短时签名( key + time )的 m3u8 地址
+ * 每次请求现签换新, 并把清单里的分片重写为经本 Worker 的地址。
+ *
+ * 不做的事(刻意剔除):
+ *   - 无首页 HTML, 无目录 API, 无 KV 缓存, 无多源 JSON 输出, 无通用 URL 代理
+ *   - 不接收任意 URL 代理请求(避免 SSRF), 只放行 m3u8 清单与分片两类
+ *
+ * 路由(仅 3 条):
+ *   GET /m3u8?url=<encoded>   换签 + 拉清单 + 分片重写
+ *   GET /s?url=<encoded>      分片 / 二进制透传(支持 Range 206)
+ *   GET /health               存活探针
+ *
+ * 签名算法:
+ *   sign = MD5( sorted_query + "&timestamp=" + ts + "&key=" + SIGN_KEY ).toUpperCase()
+ *   header: platformCode=WEB, equipmentId=0000, timestamp, sign, Referer
+ *   timestamp 为毫秒, 每次请求现算, 故上游地址无需长期维护。
+ *
+ * 换签原理:
+ *   上游 m3u8 形如 http://ytcast2.radio.cn/110/radios/40639/index_40639.m3u8?key=..&time=..
+ *   index_<n> 与 contentId 无公式关系, 必须拿 index_<n> 去目录接口做字符串匹配反查,
+ *   再从命中的条目里取本次现签地址。
+ */
+
+const SIGN_KEY = "f0fc4c668392f9f9a447e48584c214ee";
+const API_BASE = "https://ytmsout.radio.cn";
+const LIST_PATH = "/web/appBroadcast/list";
+
+/** 反查目录所需的省份集合: "0"=国家级, 330000=浙江, 310000=上海 */
+const REGIONS = ["0", "330000", "310000"];
+
+/** 允许换签的上游主机 */
+const RESIGN_HOST_RE = /^ytcast\d*\.radio\.cn$/i;
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const REFERER = "https://www.radio.cn/";
+
+const TIMEOUT_MS = 9000;
+const CATALOG_TTL_MS = 3 * 60 * 1000;
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type,Range",
+  "Access-Control-Max-Age": "86400",
+};
+
+const DROP_HEADERS = [
+  "content-encoding",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+  "set-cookie",
+  "set-cookie2",
+];
+
+// ------------------------------------------------------------------ md5
+
+/**
+ * MD5 (RFC 1321) 精简实现。
+ * Workers / Node 的 Web Crypto 均不提供 MD5, 而云听签名用的正是 MD5, 故必须内联。
+ */
+function md5(input) {
+  const bytes = unescape(encodeURIComponent(String(input)));
+  const len = bytes.length;
+
+  function rl(n, c) {
+    return (n << c) | (n >>> (32 - c));
+  }
+  function add(x, y) {
+    const l = (x & 0xffff) + (y & 0xffff);
+    const m = (x >> 16) + (y >> 16) + (l >> 16);
+    return (m << 16) | (l & 0xffff);
+  }
+  function cmn(q, a, b, x, s, t) {
+    return add(rl(add(add(a, q), add(x, t)), s), b);
+  }
+  const f = (a, b, c, d, x, s, t) => cmn((b & c) | (~b & d), a, b, x, s, t);
+  const g = (a, b, c, d, x, s, t) => cmn((b & d) | (c & ~d), a, b, x, s, t);
+  const h = (a, b, c, d, x, s, t) => cmn(b ^ c ^ d, a, b, x, s, t);
+  const i = (a, b, c, d, x, s, t) => cmn(c ^ (b | ~d), a, b, x, s, t);
+
+  const words = [];
+  for (let k = 0; k < len * 8; k += 8) {
+    words[k >> 5] = (words[k >> 5] || 0) | ((bytes.charCodeAt(k / 8) & 0xff) << k % 32);
+  }
+  const bits = len * 8;
+  words[bits >> 5] = (words[bits >> 5] || 0) | (0x80 << bits % 32);
+  words[(((bits + 64) >>> 9) << 4) + 14] = bits;
+
+  let a = 1732584193,
+    b = -271733879,
+    c = -1732584194,
+    d = 271733878;
+
+  for (let k = 0; k < words.length; k += 16) {
+    const oa = a,
+      ob = b,
+      oc = c,
+      od = d;
+    const w = (n) => words[k + n] | 0;
+    a = f(a, b, c, d, w(0), 7, -680876936);
+    d = f(d, a, b, c, w(1), 12, -389564586);
+    c = f(c, d, a, b, w(2), 17, 606105819);
+    b = f(b, c, d, a, w(3), 22, -1044525330);
+    a = f(a, b, c, d, w(4), 7, -176418897);
+    d = f(d, a, b, c, w(5), 12, 1200080426);
+    c = f(c, d, a, b, w(6), 17, -1473231341);
+    b = f(b, c, d, a, w(7), 22, -45705983);
+    a = f(a, b, c, d, w(8), 7, 1770035416);
+    d = f(d, a, b, c, w(9), 12, -1958414417);
+    c = f(c, d, a, b, w(10), 17, -42063);
+    b = f(b, c, d, a, w(11), 22, -1990404162);
+    a = f(a, b, c, d, w(12), 7, 1804603682);
+    d = f(d, a, b, c, w(13), 12, -40341101);
+    c = f(c, d, a, b, w(14), 17, -1502002290);
+    b = f(b, c, d, a, w(15), 22, 1236535329);
+    a = g(a, b, c, d, w(1), 5, -165796510);
+    d = g(d, a, b, c, w(6), 9, -1069501632);
+    c = g(c, d, a, b, w(11), 14, 643717713);
+    b = g(b, c, d, a, w(0), 20, -373897302);
+    a = g(a, b, c, d, w(5), 5, -701558691);
+    d = g(d, a, b, c, w(10), 9, 38016083);
+    c = g(c, d, a, b, w(15), 14, -660478335);
+    b = g(b, c, d, a, w(4), 20, -405537848);
+    a = g(a, b, c, d, w(9), 5, 568446438);
+    d = g(d, a, b, c, w(14), 9, -1019803690);
+    c = g(c, d, a, b, w(3), 14, -187363961);
+    b = g(b, c, d, a, w(8), 20, 1163531501);
+    a = g(a, b, c, d, w(13), 5, -1444681467);
+    d = g(d, a, b, c, w(2), 9, -51403784);
+    c = g(c, d, a, b, w(7), 14, 1735328473);
+    b = g(b, c, d, a, w(12), 20, -1926607734);
+    a = h(a, b, c, d, w(5), 4, -378558);
+    d = h(d, a, b, c, w(8), 11, -2022574463);
+    c = h(c, d, a, b, w(11), 16, 1839030562);
+    b = h(b, c, d, a, w(14), 23, -35309556);
+    a = h(a, b, c, d, w(1), 4, -1530992060);
+    d = h(d, a, b, c, w(4), 11, 1272893353);
+    c = h(c, d, a, b, w(7), 16, -155497632);
+    b = h(b, c, d, a, w(10), 23, -1094730640);
+    a = h(a, b, c, d, w(13), 4, 681279174);
+    d = h(d, a, b, c, w(0), 11, -358537222);
+    c = h(c, d, a, b, w(3), 16, -722521979);
+    b = h(b, c, d, a, w(6), 23, 76029189);
+    a = h(a, b, c, d, w(9), 4, -640364487);
+    d = h(d, a, b, c, w(12), 11, -421815835);
+    c = h(c, d, a, b, w(15), 16, 530742520);
+    b = h(b, c, d, a, w(2), 23, -995338651);
+    a = i(a, b, c, d, w(0), 6, -198630844);
+    d = i(d, a, b, c, w(7), 10, 1126891415);
+    c = i(c, d, a, b, w(14), 15, -1416354905);
+    b = i(b, c, d, a, w(5), 21, -57434055);
+    a = i(a, b, c, d, w(12), 6, 1700485571);
+    d = i(d, a, b, c, w(3), 10, -1894986606);
+    c = i(c, d, a, b, w(10), 15, -1051523);
+    b = i(b, c, d, a, w(1), 21, -2054922799);
+    a = i(a, b, c, d, w(8), 6, 1873313359);
+    d = i(d, a, b, c, w(15), 10, -30611744);
+    c = i(c, d, a, b, w(6), 15, -1560198380);
+    b = i(b, c, d, a, w(13), 21, 1309151649);
+    a = i(a, b, c, d, w(4), 6, -145523070);
+    d = i(d, a, b, c, w(11), 10, -1120210379);
+    c = i(c, d, a, b, w(2), 15, 718787259);
+    b = i(b, c, d, a, w(9), 21, -343485551);
+
+    a = add(a, oa);
+    b = add(b, ob);
+    c = add(c, oc);
+    d = add(d, od);
+  }
+
+  const HEX = "0123456789abcdef";
+  let out = "";
+  for (const v of [a, b, c, d]) {
+    for (let k = 0; k < 4; k++) {
+      const byte = (v >> (k * 8)) & 0xff;
+      out += HEX[(byte >> 4) & 0x0f] + HEX[byte & 0x0f];
+    }
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ 工具
+
+/** 超时中止信号, 兼容无 AbortSignal.timeout 的运行时 */
+function timeoutSignal(ms) {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return AbortSignal.timeout(ms);
+  }
+  const ctrl = new AbortController();
+  setTimeout(() => ctrl.abort(), ms);
+  return ctrl.signal;
+}
+
+// ------------------------------------------------------------------ 签名
+
+/** 生成带现签 header 的云听接口请求 */
+function signRequest(path, params) {
+  const ts = String(Date.now());
+  const q = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join("&");
+  return {
+    url: `${API_BASE}${path}?${q}`,
+    headers: {
+      platformCode: "WEB",
+      equipmentId: "0000",
+      timestamp: ts,
+      sign: md5(`${q}&timestamp=${ts}&key=${SIGN_KEY}`).toUpperCase(),
+      "User-Agent": UA,
+      Referer: REFERER,
+    },
+  };
+}
+
+// ------------------------------------------------------------------ 目录(换签反查用)
+
+const catalogCache = new Map(); // provinceCode -> { at, items, refreshing }
+
+function parseList(json) {
+  return (json.data || [])
+    .map((it) => {
+      const urls = [it.mp3PlayUrlHigh, it.playUrlMulti, it.mp3PlayUrlLow, it.playUrlLow]
+        .filter(Boolean)
+        .map(String);
+      const hls = urls.find((u) => /\.m3u8(\?|$)/i.test(u));
+      return { fresh: (hls || urls[0] || "").trim(), urls };
+    })
+    .filter((it) => it.fresh);
+}
+
+async function pullList(provinceCode) {
+  const { url, headers } = signRequest(LIST_PATH, { categoryId: "0", provinceCode });
+  const res = await fetch(url, { headers, signal: timeoutSignal(TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`list ${provinceCode} -> ${res.status}`);
+  return parseList(await res.json());
+}
+
+/**
+ * 取某省目录。缓存过期时先返回旧数据并在后台刷新, 避免换签路径被同步阻塞。
+ */
+async function catalogOf(provinceCode) {
+  const hit = catalogCache.get(provinceCode);
+  if (hit) {
+    if (Date.now() - hit.at >= CATALOG_TTL_MS && !hit.refreshing) {
+      hit.refreshing = true;
+      pullList(provinceCode)
+        .then((items) => catalogCache.set(provinceCode, { at: Date.now(), items }))
+        .catch(() => {})
+        .finally(() => {
+          const cur = catalogCache.get(provinceCode);
+          if (cur) cur.refreshing = false;
+        });
+    }
+    return hit.items;
+  }
+  const items = await pullList(provinceCode);
+  catalogCache.set(provinceCode, { at: Date.now(), items });
+  return items;
+}
+
+/**
+ * 按 index 号反查现签地址: 三省并行, 谁先命中用谁, 不必等最慢的一省。
+ */
+async function findByIndex(index) {
+  const needle = `index_${index}.m3u8`;
+  const tasks = REGIONS.map((p) =>
+    catalogOf(p)
+      .then((items) => items.find((it) => it.urls.some((u) => u.includes(needle))) || null)
+      .catch(() => null)
+  );
+
+  return new Promise((resolve) => {
+    let pending = tasks.length;
+    for (const t of tasks) {
+      t.then((hit) => {
+        if (hit) resolve(hit);
+        else if (--pending === 0) resolve(null);
+      });
+    }
+  });
+}
+
+/**
+ * 换签: 传入上游地址, 返回本次现签的新地址; 不可换签时返回 null。
+ */
+async function renew(targetUrl) {
+  let host;
+  try {
+    host = new URL(targetUrl).hostname;
+  } catch (_) {
+    return null;
+  }
+  if (!RESIGN_HOST_RE.test(host)) return null;
+
+  const hit = String(targetUrl).match(/index_(\d+)\.m3u8/i);
+  if (!hit) return null;
+
+  const found = await findByIndex(hit[1]);
+  return found && found.fresh ? found.fresh : null;
+}
+
+// ------------------------------------------------------------------ 流代理
+
+function abs(ref, base) {
+  try {
+    return new URL(ref, base).toString();
+  } catch (_) {
+    return ref;
+  }
+}
+
+function rewritePlaylist(text, baseUrl, origin) {
+  const out = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      out.push(rawLine);
+      continue;
+    }
+
+    if (line.startsWith("#")) {
+      // PlayHLS 缺逗号会解析成空列表, 强制补齐
+      if (/^#EXTINF:\s*[\d.]+$/.test(line)) {
+        out.push(line + ",");
+        continue;
+      }
+      // 标签内的 URI="" 同样要改写(K / MAP / MEDIA 等)
+      if (/URI="/.test(line)) {
+        out.push(
+          rawLine.replace(/URI="([^"]+)"/g, (m, uri) => {
+            if (!uri || uri.startsWith("data:")) return m;
+            return `URI="${origin}/s?url=${encodeURIComponent(abs(uri, baseUrl))}"`;
+          })
+        );
+        continue;
+      }
+      out.push(rawLine);
+      continue;
+    }
+
+    const target = abs(line, baseUrl);
+    const isSub = /\.m3u8?(\?|$)/i.test(target);
+    out.push(
+      isSub
+        ? `${origin}/m3u8?url=${encodeURIComponent(target)}`
+        : `${origin}/s?url=${encodeURIComponent(target)}`
+    );
+  }
+  return out.join("\n");
+}
+
+async function servePlaylist(targetUrl, origin) {
+  const res = await fetch(targetUrl, {
+    headers: { "User-Agent": UA, Referer: REFERER },
+    signal: timeoutSignal(TIMEOUT_MS),
+  });
+
+  // 上游非 2xx: 原样透传状态(403 多为签名失效, 404 多为地址过期)
+  if (!res.ok) return fail(res.status, "upstream", res.status);
+
+  const buf = await res.arrayBuffer();
+  const text = new TextDecoder("utf-8").decode(buf);
+
+  // 上游可能是占位流 / 音频裸流而非清单
+  if (!text.trimStart().startsWith("#EXTM3U")) {
+    return new Response(buf, {
+      status: res.status,
+      headers: {
+        ...CORS,
+        "Content-Type": res.headers.get("content-type") || "application/octet-stream",
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  return new Response(rewritePlaylist(text, res.url || targetUrl, origin), {
+    status: 200,
+    headers: {
+      ...CORS,
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+async function serveSegment(targetUrl, req) {
+  const headers = { "User-Agent": UA, Referer: REFERER };
+  const range = req.headers.get("range");
+  if (range) headers.Range = range;
+
+  const res = await fetch(targetUrl, { headers, signal: timeoutSignal(TIMEOUT_MS) });
+
+  const out = new Headers(CORS);
+  for (const [k, v] of res.headers) {
+    if (!DROP_HEADERS.includes(k.toLowerCase())) out.set(k, v);
+  }
+  out.set("Cache-Control", "no-store");
+  if (!out.get("content-type")) out.set("content-type", "application/octet-stream");
+
+  return new Response(res.body, { status: res.status, headers: out });
+}
+
+function fail(status, code, detail) {
+  return new Response(JSON.stringify({ ok: false, error: code, detail }), {
+    status,
+    headers: { ...CORS, "Content-Type": "application/json; charset=utf-8" },
+  });
+}
+
+// ------------------------------------------------------------------ 入口
+
+export default {
+  async fetch(request) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+
+    const url = new URL(request.url);
+    const origin = url.origin;
+    const target = url.searchParams.get("url");
+
+    if (url.pathname === "/health") {
+      return new Response("OK", { status: 200, headers: CORS });
+    }
+
+    if (url.pathname === "/m3u8" || url.pathname === "/m3u8.m3u8") {
+      if (!target) return fail(400, "missing_url", "?url= required");
+      if (target.startsWith(origin)) return fail(400, "loop", "self-reference");
+
+      let finalUrl = target;
+      let renewed = false;
+      try {
+        const fresh = await renew(target);
+        if (fresh) {
+          finalUrl = fresh;
+          renewed = true;
+        }
+      } catch (_) {
+        // 换签失败不阻断: 退回原地址透传, 由上游决定成败
+      }
+
+      try {
+        const resp = await servePlaylist(finalUrl, origin);
+        if (!renewed) return resp;
+        // 不改原 Response 的 header(部分运行时只读), 复制一份加标记
+        const h = new Headers(resp.headers);
+        h.set("X-Renewed", "1");
+        return new Response(resp.body, { status: resp.status, headers: h });
+      } catch (e) {
+        return fail(502, "fetch_error", String((e && e.message) || e));
+      }
+    }
+
+    if (url.pathname === "/s") {
+      if (!target) return fail(400, "missing_url", "?url= required");
+      if (target.startsWith(origin)) return fail(400, "loop", "self-reference");
+      try {
+        return await serveSegment(target, request);
+      } catch (e) {
+        return fail(502, "fetch_error", String((e && e.message) || e));
+      }
+    }
+
+    return new Response(
+      "radio.cn sign worker\n\n" +
+        "GET /m3u8?url=<encoded>   renew sign + rewrite playlist\n" +
+        "GET /s?url=<encoded>      segment passthrough (Range 206)\n" +
+        "GET /health               liveness probe\n",
+      { status: 200, headers: { ...CORS, "Content-Type": "text/plain; charset=utf-8" } }
+    );
+  },
+};
